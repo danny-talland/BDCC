@@ -111,6 +111,7 @@ byte 9  packet byte 5
 - `bit0`: packet is geldig
 - `bit1`: packet is broadcast (`address 0`)
 - `bit2`: resend/high-priority
+- `bit3`: keepalive zonder DCC-payload
 
 ### Filtering zender
 
@@ -129,24 +130,39 @@ Niet doorsturen in versie 1:
 2. Decodeer preamble, databits en XOR-byte.
 3. Valideer packetlengte en checksum.
 4. Filter alleen relevante adressen `1..20` plus broadcast.
-5. Verstuur packet via `NRF24`.
+5. Verstuur nieuwe packets direct via `NRF24`.
+6. Herhaal gecachte packets periodiek voor multi-ontvanger gedrag.
+7. Stuur een keepalive als er tijdelijk geen nieuw DCC-packet langskomt.
 
 ## Werking ontvanger
 
 1. Ontvang packet via `NRF24`.
-2. Sla laatste pakket per slot op.
-3. Herhaal alle actieve slots cyclisch als DCC-packets.
-4. Vul op met idle-packets wanneer nodig.
-5. Bij radio-timeout:
-   snelheid in decoder blijft afhangen van laatst ontvangen DCC; daarom moet de zender regelmatig herhalen.
+2. Sla functie- en broadcast-pakketten per slot op.
+3. Decodeer snelheidspakketten per locadres en bewaar die als lokale toestand.
+4. Herhaal alle actieve slots cyclisch als DCC-packets.
+5. Genereer snelheidspakketten synthetisch uit de lokale toestand.
+6. Vul op met idle-packets wanneer nodig.
+7. Bij radio-timeout remt de ontvanger lokaal af naar `0`.
+8. Zodra radioverkeer terugkeert trekt de ontvanger weer op naar de laatst bekende snelheid.
+9. `Timer1` klokt de DCC half-bits uit; de hoofdlus staged alleen nieuwe packets.
+
+## Fail-safe constants
+
+In de ontvanger zitten drie `const` waarden om mee te testen:
+
+- `SIGNAL_LOSS_TIMEOUT_MS`
+- `RAMP_STEP_INTERVAL_MS`
+- `RAMP_STEP_DELTA`
+
+Daarmee kun je de veilige marge en rem/optrekvertraging tunen zonder de structuur te wijzigen.
 
 ## Belangrijke beperking van deze eerste versie
 
 - Nog geen volledige NMRA-decode van alle packetvarianten
 - Alleen korte adressen
-- Geen adaptive packet-prioritering
+- Speed-packets zijn in deze versie gericht op `28` en `128` speed steps
 - Geen bevestigde radio-link
-- DCC-uitgang gebeurt in software; voor hogere robuustheid kan later Timer1 worden ingezet
+- DCC-uitgang gebruikt nu `Timer1`; verdere verfijning zit vooral nog in protocoldekking en hardwaretest
 - Sketches zijn een eerste prototypebasis en nog niet op hardware gecompileerd/getest
 
 ## Eerste testvolgorde
