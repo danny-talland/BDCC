@@ -16,17 +16,7 @@ constexpr bool LORA_FIXED_LENGTH = false;
 constexpr bool LORA_IQ_INVERSION = false;
 constexpr uint32_t LINK_TIMEOUT_MS = 3000;
 constexpr uint32_t DISPLAY_UPDATE_MS = 150;
-
-constexpr uint16_t TEST_MAGIC = 0xBEEF;
-constexpr uint8_t TEST_VERSION = 1;
-
-struct TestFrame {
-  uint16_t magic;
-  uint8_t version;
-  uint16_t sequence;
-  uint32_t uptimeMs;
-  uint8_t checksum;
-};
+constexpr uint8_t PACKET_TEXT_BUFFER_SIZE = 64;
 
 #ifdef WIRELESS_STICK_V3
 static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_64_32, RST_OLED);
@@ -36,7 +26,7 @@ static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RS
 
 static RadioEvents_t radioEvents;
 volatile bool pendingFrameReady = false;
-TestFrame pendingFrame{};
+char pendingPacket[PACKET_TEXT_BUFFER_SIZE] = {};
 bool loraIdle = true;
 bool linkSeen = false;
 uint16_t lastSequence = 0;
@@ -46,15 +36,6 @@ int16_t lastRssi = 0;
 int8_t lastSnr = 0;
 uint32_t lastRxMs = 0;
 uint32_t lastDisplayMs = 0;
-
-uint8_t checksumFrame(const TestFrame &frame) {
-  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&frame);
-  uint8_t x = 0;
-  for (uint8_t i = 0; i < sizeof(TestFrame) - 1; ++i) {
-    x ^= bytes[i];
-  }
-  return x;
-}
 
 void drawNoLinkIcon() {
   display.drawLine(48, 44, 64, 16);
@@ -117,33 +98,35 @@ void processPendingFrame() {
     return;
   }
 
-  TestFrame frame{};
+  char packet[PACKET_TEXT_BUFFER_SIZE] = {};
   noInterrupts();
-  memcpy(&frame, &pendingFrame, sizeof(frame));
+  memcpy(packet, pendingPacket, sizeof(packet));
   pendingFrameReady = false;
   interrupts();
 
-  if (frame.magic != TEST_MAGIC ||
-      frame.version != TEST_VERSION ||
-      frame.checksum != checksumFrame(frame)) {
+  unsigned int parsedSequence = 0;
+  unsigned long parsedUptime = 0;
+  if (sscanf(packet, "BDCC,%u,%lu", &parsedSequence, &parsedUptime) != 2) {
     ++droppedCount;
+    Serial.printf("RX invalid \"%s\"\n", packet);
     return;
   }
 
+  const uint16_t sequence = static_cast<uint16_t>(parsedSequence);
   if (linkSeen) {
     const uint16_t expected = static_cast<uint16_t>(lastSequence + 1);
-    if (frame.sequence != expected) {
-      droppedCount += static_cast<uint16_t>(frame.sequence - expected);
+    if (sequence != expected) {
+      droppedCount += static_cast<uint16_t>(sequence - expected);
     }
   }
 
   linkSeen = true;
-  lastSequence = frame.sequence;
+  lastSequence = sequence;
   lastRxMs = millis();
   ++receivedCount;
 
-  Serial.printf("RX seq=%u rssi=%d snr=%d received=%u dropped=%u\n",
-                frame.sequence,
+  Serial.printf("received packet \"%s\" rssi=%d snr=%d received=%u dropped=%u\n",
+                packet,
                 lastRssi,
                 lastSnr,
                 receivedCount,
@@ -151,14 +134,14 @@ void processPendingFrame() {
 }
 
 void onRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
-  if (size == sizeof(TestFrame)) {
-    memcpy(&pendingFrame, payload, sizeof(TestFrame));
-    pendingFrameReady = true;
-    lastRssi = rssi;
-    lastSnr = snr;
-  } else {
-    ++droppedCount;
+  const uint16_t copyLength = size < (PACKET_TEXT_BUFFER_SIZE - 1) ? size : (PACKET_TEXT_BUFFER_SIZE - 1);
+  memset(pendingPacket, 0, sizeof(pendingPacket));
+  if (copyLength > 0) {
+    memcpy(pendingPacket, payload, copyLength);
   }
+  pendingFrameReady = true;
+  lastRssi = rssi;
+  lastSnr = snr;
 
   Radio.Sleep();
   loraIdle = true;
