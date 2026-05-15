@@ -101,7 +101,22 @@ bool ledState = false;
 
 void setLed(bool on) {
   ledState = on;
-  digitalWrite(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH ? on : !on);
+  const uint8_t level = STATUS_LED_ACTIVE_HIGH ? on : !on;
+  digitalWrite(PIN_STATUS_LED, level);
+#if defined(LED_BUILTIN)
+  if (LED_BUILTIN != PIN_STATUS_LED) {
+    digitalWrite(LED_BUILTIN, level);
+  }
+#endif
+}
+
+void configureStatusLeds() {
+  pinMode(PIN_STATUS_LED, OUTPUT);
+#if defined(LED_BUILTIN)
+  if (LED_BUILTIN != PIN_STATUS_LED) {
+    pinMode(LED_BUILTIN, OUTPUT);
+  }
+#endif
 }
 
 uint8_t checksumFrame(const RadioFrame &frame) {
@@ -516,7 +531,7 @@ void updateStatusLed() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_STATUS_LED, OUTPUT);
+  configureStatusLeds();
   setLed(true);
 
   loadConfig();

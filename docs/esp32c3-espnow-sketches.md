@@ -82,6 +82,8 @@ constexpr bool ENABLE_HBRIDGE_EN_PIN = false;
 
 Let op: veel ESP32-C3 boards gebruiken GPIO8 als onboard LED, maar niet allemaal. Pas `PIN_STATUS_LED` aan per board.
 
+De sketches sturen zowel `PIN_STATUS_LED` als `LED_BUILTIN` aan. Als het board package `LED_BUILTIN` op dezelfde pin zet als `PIN_STATUS_LED`, wordt die pin maar één keer aangestuurd. De ingebouwde LED en externe statusled tonen dus hetzelfde patroon.
+
 ## DCC Output
 
 De receiver gebruikt twee RMT TX-kanalen:
@@ -143,12 +145,21 @@ Gecontroleerd op:
 esp32:esp32:esp32c3
 ```
 
+Voor native USB-serial op veel ESP32-C3 boards moet in de Arduino IDE staan:
+
+```text
+Tools -> USB CDC On Boot -> Enabled
+Serial Monitor -> 115200 baud
+```
+
+Als `USB CDC On Boot` uit staat, zie je vaak alleen de ROM bootregel zoals `ESP-ROM:esp32c3-api1-20210207` en geen `Serial` output van de sketch.
+
 Resultaat:
 
 ```text
 esp32c3_espnow_central:
-Sketch uses 954755 bytes (72%) flash
-Global variables use 36964 bytes (11%) RAM
+Sketch uses 956023 bytes (72%) flash
+Global variables use 36980 bytes (11%) RAM
 
 esp32c3_espnow_receiver:
 Sketch uses 948673 bytes (72%) flash

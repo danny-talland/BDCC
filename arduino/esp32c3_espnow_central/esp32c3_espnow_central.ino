@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <stdarg.h>
 #include <string.h>
 
 namespace {
@@ -9,6 +10,7 @@ namespace {
 constexpr uint8_t PIN_DCC_IN = 2;
 constexpr uint8_t PIN_STATUS_LED = 8;
 constexpr bool STATUS_LED_ACTIVE_HIGH = true;
+constexpr bool DEBUG_SERIAL = true;
 
 constexpr uint8_t ESPNOW_CHANNEL = 6;
 constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -31,6 +33,7 @@ constexpr uint32_t KEEPALIVE_INTERVAL_MS = 1000;
 constexpr uint32_t DCC_SOURCE_TIMEOUT_MS = 1500;
 constexpr uint32_t LED_HEALTH_BLINK_MS = 1000;
 constexpr uint32_t LED_TX_FLASH_MS = 40;
+constexpr uint32_t DEBUG_PACKET_INTERVAL_MS = 250;
 
 enum FrameType : uint8_t {
   FRAME_TYPE_DCC_PACKET = 1,
@@ -87,6 +90,10 @@ uint32_t lastKeepaliveMs = 0;
 uint32_t lastTxMs = 0;
 uint32_t lastLedToggleMs = 0;
 bool ledState = false;
+uint32_t lastDebugPacketMs = 0;
+uint32_t decodedPacketCount = 0;
+uint32_t sentFrameCount = 0;
+uint32_t sendFailCount = 0;
 
 CachedPacket packetSlots[MAX_PACKET_SLOTS] = {};
 RadioFrame txQueue[TX_QUEUE_SIZE] = {};
@@ -94,9 +101,47 @@ uint8_t txQueueHead = 0;
 uint8_t txQueueTail = 0;
 volatile bool espNowBusy = false;
 
+void debugPrintln(const char *message) {
+  if (DEBUG_SERIAL) {
+    Serial.println(message);
+  }
+}
+
+void debugPrintln() {
+  if (DEBUG_SERIAL) {
+    Serial.println();
+  }
+}
+
+void debugPrintf(const char *format, ...) {
+  if (!DEBUG_SERIAL) {
+    return;
+  }
+
+  va_list args;
+  va_start(args, format);
+  Serial.vprintf(format, args);
+  va_end(args);
+}
+
 void setLed(bool on) {
   ledState = on;
-  digitalWrite(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH ? on : !on);
+  const uint8_t level = STATUS_LED_ACTIVE_HIGH ? on : !on;
+  digitalWrite(PIN_STATUS_LED, level);
+#if defined(LED_BUILTIN)
+  if (LED_BUILTIN != PIN_STATUS_LED) {
+    digitalWrite(LED_BUILTIN, level);
+  }
+#endif
+}
+
+void configureStatusLeds() {
+  pinMode(PIN_STATUS_LED, OUTPUT);
+#if defined(LED_BUILTIN)
+  if (LED_BUILTIN != PIN_STATUS_LED) {
+    pinMode(LED_BUILTIN, OUTPUT);
+  }
+#endif
 }
 
 uint8_t checksumBytes(const uint8_t *data, uint8_t length) {
@@ -169,9 +214,14 @@ void queueKeepalive() {
   enqueueFrame(frame);
 }
 
-void onEspNowSent(const esp_now_send_info_t *, esp_now_send_status_t) {
+void onEspNowSent(const esp_now_send_info_t *, esp_now_send_status_t status) {
   espNowBusy = false;
   lastTxMs = millis();
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    ++sentFrameCount;
+  } else {
+    ++sendFailCount;
+  }
 }
 
 void pumpEspNowTx() {
@@ -181,8 +231,12 @@ void pumpEspNowTx() {
 
   RadioFrame frame = txQueue[txQueueTail];
   txQueueTail = static_cast<uint8_t>((txQueueTail + 1) % TX_QUEUE_SIZE);
-  if (esp_now_send(broadcastAddress, reinterpret_cast<uint8_t *>(&frame), sizeof(frame)) == ESP_OK) {
+  const esp_err_t result = esp_now_send(broadcastAddress, reinterpret_cast<uint8_t *>(&frame), sizeof(frame));
+  if (result == ESP_OK) {
     espNowBusy = true;
+  } else {
+    ++sendFailCount;
+    debugPrintf("ESP-NOW send start failed: %d\n", static_cast<int>(result));
   }
 }
 
@@ -395,6 +449,16 @@ void finishPacket() {
       validateDccChecksum(packetBytes, packetLength) &&
       isRelevantPacket(packetBytes, packetLength)) {
     lastDccSourceMs = millis();
+    ++decodedPacketCount;
+    if (DEBUG_SERIAL && (millis() - lastDebugPacketMs) >= DEBUG_PACKET_INTERVAL_MS) {
+      lastDebugPacketMs = millis();
+      debugPrintf("DCC packet addr=%u len=%u decoded=%lu sent=%lu fail=%lu\n",
+                  packetBytes[0],
+                  packetLength,
+                  static_cast<unsigned long>(decodedPacketCount),
+                  static_cast<unsigned long>(sentFrameCount),
+                  static_cast<unsigned long>(sendFailCount));
+    }
     if (storePacketIfChanged(packetBytes, packetLength)) {
       queueDccPacket(packetBytes, packetLength, true);
       markPacketSent(packetBytes, packetLength);
@@ -496,14 +560,19 @@ void processHalfBitStream() {
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t result = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  debugPrintf("WiFi STA MAC: %s\n", WiFi.macAddress().c_str());
+  debugPrintf("ESP-NOW channel set result: %d\n", static_cast<int>(result));
 
-  if (esp_now_init() != ESP_OK) {
+  result = esp_now_init();
+  if (result != ESP_OK) {
+    debugPrintf("ESP-NOW init failed: %d\n", static_cast<int>(result));
     while (true) {
       setLed(!ledState);
       delay(100);
     }
   }
+  debugPrintln("ESP-NOW init OK");
 
   esp_now_register_send_cb(onEspNowSent);
 
@@ -512,7 +581,8 @@ void setupEspNow() {
   peer.channel = ESPNOW_CHANNEL;
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
-  esp_now_add_peer(&peer);
+  result = esp_now_add_peer(&peer);
+  debugPrintf("ESP-NOW broadcast peer add result: %d\n", static_cast<int>(result));
 }
 
 void updateStatusLed() {
@@ -532,7 +602,18 @@ void updateStatusLed() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_STATUS_LED, OUTPUT);
+  delay(500);
+  debugPrintln();
+  debugPrintln("BDCC ESP32-C3 ESP-NOW central boot");
+  debugPrintf("Build: %s %s\n", __DATE__, __TIME__);
+  debugPrintf("DCC input GPIO: %u, status LED GPIO: %u\n", PIN_DCC_IN, PIN_STATUS_LED);
+#if defined(LED_BUILTIN)
+  debugPrintf("LED_BUILTIN GPIO: %d\n", LED_BUILTIN);
+#else
+  debugPrintln("LED_BUILTIN not defined by board package");
+#endif
+
+  configureStatusLeds();
   setLed(true);
 
   pinMode(PIN_DCC_IN, INPUT);
@@ -541,6 +622,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_DCC_IN), onDccEdge, CHANGE);
   resetDecoder();
   lastEdgeMicros = micros();
+  debugPrintln("DCC edge interrupt attached");
+  debugPrintln("Setup complete");
 }
 
 void loop() {
