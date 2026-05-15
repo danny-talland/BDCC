@@ -4,6 +4,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "esp32-hal-rmt.h"
+#include <stdarg.h>
 #include <string.h>
 
 namespace {
@@ -14,6 +15,7 @@ constexpr uint8_t PIN_HBRIDGE_EN = 5;
 constexpr uint8_t PIN_STATUS_LED = 8;
 constexpr bool ENABLE_HBRIDGE_EN_PIN = false;
 constexpr bool STATUS_LED_ACTIVE_HIGH = true;
+constexpr bool DEBUG_SERIAL = true;
 
 constexpr uint8_t ESPNOW_CHANNEL = 6;
 constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -31,6 +33,8 @@ constexpr uint16_t DCC_0_HALFPERIOD = 100;
 constexpr uint32_t PACKET_SLOT_EXPIRE_MS = 10000;
 constexpr uint32_t PAYLOAD_ACTIVITY_MS = 120;
 constexpr uint32_t STARTUP_LED_MS = 1000;
+constexpr uint32_t DEBUG_FRAME_INTERVAL_MS = 500;
+constexpr uint32_t DEBUG_STATS_INTERVAL_MS = 5000;
 constexpr uint16_t EEPROM_SIZE = 64;
 constexpr uint16_t EEPROM_CONFIG_ADDRESS = 0;
 constexpr uint16_t CONFIG_MAGIC = 0xBDCC;
@@ -93,11 +97,44 @@ uint32_t lastPayloadMs = 0;
 uint32_t lastKeepaliveMs = 0;
 uint32_t lastConfigMs = 0;
 uint32_t lastLedMs = 0;
+uint32_t lastDebugFrameMs = 0;
+uint32_t lastDebugStatsMs = 0;
+uint32_t receivedFrameCount = 0;
+uint32_t acceptedFrameCount = 0;
+uint32_t payloadFrameCount = 0;
+uint32_t keepaliveFrameCount = 0;
+uint32_t configFrameCount = 0;
+uint32_t invalidFrameCount = 0;
+uint32_t staleSequenceCount = 0;
 uint8_t lastSequence = 0;
 uint8_t roundRobinIndex = 0;
 bool lastSequenceValid = false;
 bool hasSeenPayload = false;
 bool ledState = false;
+bool lastLinkAliveState = true;
+
+void debugPrintln(const char *message) {
+  if (DEBUG_SERIAL) {
+    Serial.println(message);
+  }
+}
+
+void debugPrintln() {
+  if (DEBUG_SERIAL) {
+    Serial.println();
+  }
+}
+
+void debugPrintf(const char *format, ...) {
+  if (!DEBUG_SERIAL) {
+    return;
+  }
+
+  va_list args;
+  va_start(args, format);
+  Serial.vprintf(format, args);
+  va_end(args);
+}
 
 void setLed(bool on) {
   ledState = on;
@@ -390,6 +427,8 @@ bool handleConfigPomWrite(const RadioFrame &frame) {
                                             frame.data[2]) + 1;
   if (applyConfigCv(cv, frame.data[3])) {
     lastConfigMs = millis();
+    ++configFrameCount;
+    debugPrintf("Config CV%u=%u applied\n", cv, frame.data[3]);
   }
   return true;
 }
@@ -453,7 +492,9 @@ void serviceDccOutput() {
 }
 
 void onEspNowReceive(const esp_now_recv_info_t *, const uint8_t *data, int len) {
+  ++receivedFrameCount;
   if (len != static_cast<int>(sizeof(RadioFrame))) {
+    ++invalidFrameCount;
     return;
   }
   memcpy(&pendingFrame, data, sizeof(RadioFrame));
@@ -474,18 +515,36 @@ void processPendingFrame() {
   if (frame.magic != PROTOCOL_MAGIC ||
       frame.version != PROTOCOL_VERSION ||
       frame.length > MAX_DCC_PACKET_BYTES ||
-      frame.checksum != checksumFrame(frame) ||
-      !isNewerSequence(frame.sequence)) {
+      frame.checksum != checksumFrame(frame)) {
+    ++invalidFrameCount;
+    return;
+  }
+  if (!isNewerSequence(frame.sequence)) {
+    ++staleSequenceCount;
     return;
   }
 
+  ++acceptedFrameCount;
   lastRadioMs = millis();
   if (frame.type == FRAME_TYPE_KEEPALIVE) {
     lastKeepaliveMs = lastRadioMs;
+    ++keepaliveFrameCount;
     return;
   }
   if (frame.type == FRAME_TYPE_DCC_PACKET) {
     lastPayloadMs = lastRadioMs;
+    ++payloadFrameCount;
+    if (DEBUG_SERIAL && (millis() - lastDebugFrameMs) >= DEBUG_FRAME_INTERVAL_MS) {
+      lastDebugFrameMs = millis();
+      debugPrintf("Payload addr=%u len=%u seq=%u rx=%lu ok=%lu invalid=%lu stale=%lu\n",
+                  frame.data[0],
+                  frame.length,
+                  frame.sequence,
+                  static_cast<unsigned long>(receivedFrameCount),
+                  static_cast<unsigned long>(acceptedFrameCount),
+                  static_cast<unsigned long>(invalidFrameCount),
+                  static_cast<unsigned long>(staleSequenceCount));
+    }
     storePacket(frame);
   }
 }
@@ -493,15 +552,48 @@ void processPendingFrame() {
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_err_t result = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  debugPrintf("WiFi STA MAC: %s\n", WiFi.macAddress().c_str());
+  debugPrintf("ESP-NOW channel set result: %d\n", static_cast<int>(result));
 
-  if (esp_now_init() != ESP_OK) {
+  result = esp_now_init();
+  if (result != ESP_OK) {
+    debugPrintf("ESP-NOW init failed: %d\n", static_cast<int>(result));
     while (true) {
       setLed(!ledState);
       delay(100);
     }
   }
+  debugPrintln("ESP-NOW init OK");
   esp_now_register_recv_cb(onEspNowReceive);
+  debugPrintln("ESP-NOW receive callback registered");
+}
+
+void updateDebugStats() {
+  if (!DEBUG_SERIAL) {
+    return;
+  }
+
+  const bool linkAlive = isLinkAlive();
+  if (linkAlive != lastLinkAliveState) {
+    lastLinkAliveState = linkAlive;
+    debugPrintf("Link %s at %lu ms\n", linkAlive ? "UP" : "DOWN", static_cast<unsigned long>(millis()));
+  }
+
+  const uint32_t now = millis();
+  if ((now - lastDebugStatsMs) < DEBUG_STATS_INTERVAL_MS) {
+    return;
+  }
+  lastDebugStatsMs = now;
+  debugPrintf("Stats rx=%lu ok=%lu payload=%lu keepalive=%lu config=%lu invalid=%lu stale=%lu link=%s\n",
+              static_cast<unsigned long>(receivedFrameCount),
+              static_cast<unsigned long>(acceptedFrameCount),
+              static_cast<unsigned long>(payloadFrameCount),
+              static_cast<unsigned long>(keepaliveFrameCount),
+              static_cast<unsigned long>(configFrameCount),
+              static_cast<unsigned long>(invalidFrameCount),
+              static_cast<unsigned long>(staleSequenceCount),
+              linkAlive ? "UP" : "DOWN");
 }
 
 void updateStatusLed() {
@@ -531,16 +623,39 @@ void updateStatusLed() {
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
+  debugPrintln();
+  debugPrintln("BDCC ESP32-C3 ESP-NOW receiver boot");
+  debugPrintf("Build: %s %s\n", __DATE__, __TIME__);
+  debugPrintf("DCC output GPIOs: A=%u B=%u, status LED GPIO: %u\n",
+              PIN_DCC_OUT_A,
+              PIN_DCC_OUT_B,
+              PIN_STATUS_LED);
+#if defined(LED_BUILTIN)
+  debugPrintf("LED_BUILTIN GPIO: %d\n", LED_BUILTIN);
+#else
+  debugPrintln("LED_BUILTIN not defined by board package");
+#endif
+
   configureStatusLeds();
   setLed(true);
 
   loadConfig();
+  debugPrintf("Config: linkTimeout=%u00ms brake=%u00ms accel=%u00ms maxResume=%u hold=%u\n",
+              receiverConfig.linkDownTicks100ms,
+              receiverConfig.linkDownBrakeTicks100ms,
+              receiverConfig.linkUpAccelTicks100ms,
+              receiverConfig.maxResumeSpeedStep,
+              receiverConfig.holdAfterLinkUp);
   initializeDccOutput();
+  debugPrintln("DCC RMT output initialized");
   setupEspNow();
 
   startupMs = millis();
   lastRadioMs = startupMs;
   lastKeepaliveMs = startupMs;
+  lastLinkAliveState = isLinkAlive();
+  debugPrintln("Setup complete");
 }
 
 void loop() {
@@ -548,4 +663,5 @@ void loop() {
   expireOldPackets();
   serviceDccOutput();
   updateStatusLed();
+  updateDebugStats();
 }

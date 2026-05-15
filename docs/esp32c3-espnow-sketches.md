@@ -154,16 +154,54 @@ Serial Monitor -> 115200 baud
 
 Als `USB CDC On Boot` uit staat, zie je vaak alleen de ROM bootregel zoals `ESP-ROM:esp32c3-api1-20210207` en geen `Serial` output van de sketch.
 
+De receiver print bij boot nu onder andere:
+
+```text
+BDCC ESP32-C3 ESP-NOW receiver boot
+Config: linkTimeout=...
+DCC RMT output initialized
+ESP-NOW init OK
+ESP-NOW receive callback registered
+Setup complete
+```
+
+Tijdens bedrijf print de receiver beperkt:
+
+```text
+Payload addr=3 len=3 seq=...
+Stats rx=... ok=... payload=... keepalive=... invalid=... stale=... link=UP
+Link DOWN at ... ms
+```
+
+De centrale print nu extra ESP-NOW diagnose, inclusief keepalive-zendingen. In debugmodus staat `SEND_KEEPALIVE_WITHOUT_DCC_SOURCE = true`; daardoor stuurt de centrale keepalives ook als er nog geen DCC van de Mega wordt gedecodeerd. Dat maakt testen eenvoudiger:
+
+- Receiver wordt `link=UP`: ESP-NOW werkt, DCC-input/decode is dan de volgende verdachte als `dcc=NO` blijft.
+- Receiver blijft `link=DOWN`: ESP-NOW kanaal, boardselectie, upload of receiver-code is de verdachte.
+
+Voorbeeld central output:
+
+```text
+Keepalive queued seq=12 dccSource=NO queuedKeepalive=12
+Stats dcc=NO decoded=0 payloadQ=0 refreshQ=0 keepaliveQ=12 sendStart=12 sentOk=12 fail=0 drop=0 queue=0 busy=0 lastType=2 lastSeq=11
+```
+
+Bij werkende DCC-input verschijnt ook:
+
+```text
+DCC source ACTIVE at ... ms
+DCC packet addr=3 len=3 decoded=...
+```
+
 Resultaat:
 
 ```text
 esp32c3_espnow_central:
-Sketch uses 956023 bytes (72%) flash
-Global variables use 36980 bytes (11%) RAM
+Sketch uses 956713 bytes (72%) flash
+Global variables use 37012 bytes (11%) RAM
 
 esp32c3_espnow_receiver:
-Sketch uses 948673 bytes (72%) flash
-Global variables use 36124 bytes (11%) RAM
+Sketch uses 950509 bytes (72%) flash
+Global variables use 36164 bytes (11%) RAM
 ```
 
 ## Open Punten

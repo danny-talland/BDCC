@@ -11,6 +11,7 @@ constexpr uint8_t PIN_DCC_IN = 2;
 constexpr uint8_t PIN_STATUS_LED = 8;
 constexpr bool STATUS_LED_ACTIVE_HIGH = true;
 constexpr bool DEBUG_SERIAL = true;
+constexpr bool SEND_KEEPALIVE_WITHOUT_DCC_SOURCE = true;
 
 constexpr uint8_t ESPNOW_CHANNEL = 6;
 constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -34,6 +35,8 @@ constexpr uint32_t DCC_SOURCE_TIMEOUT_MS = 1500;
 constexpr uint32_t LED_HEALTH_BLINK_MS = 1000;
 constexpr uint32_t LED_TX_FLASH_MS = 40;
 constexpr uint32_t DEBUG_PACKET_INTERVAL_MS = 250;
+constexpr uint32_t DEBUG_STATS_INTERVAL_MS = 5000;
+constexpr uint32_t DEBUG_KEEPALIVE_INTERVAL_MS = 1000;
 
 enum FrameType : uint8_t {
   FRAME_TYPE_DCC_PACKET = 1,
@@ -91,9 +94,19 @@ uint32_t lastTxMs = 0;
 uint32_t lastLedToggleMs = 0;
 bool ledState = false;
 uint32_t lastDebugPacketMs = 0;
+uint32_t lastDebugStatsMs = 0;
+uint32_t lastDebugKeepaliveMs = 0;
 uint32_t decodedPacketCount = 0;
+uint32_t queuedPayloadCount = 0;
+uint32_t queuedKeepaliveCount = 0;
+uint32_t queuedRefreshCount = 0;
+uint32_t droppedQueueFrameCount = 0;
+uint32_t espNowSendStartCount = 0;
 uint32_t sentFrameCount = 0;
 uint32_t sendFailCount = 0;
+uint8_t lastSentFrameType = 0;
+uint8_t lastSentFrameSequence = 0;
+bool lastDccSourceAliveState = false;
 
 CachedPacket packetSlots[MAX_PACKET_SLOTS] = {};
 RadioFrame txQueue[TX_QUEUE_SIZE] = {};
@@ -172,6 +185,7 @@ bool queueEmpty() {
 void enqueueFrame(const RadioFrame &frame) {
   if (queueFull()) {
     txQueueTail = static_cast<uint8_t>((txQueueTail + 1) % TX_QUEUE_SIZE);
+    ++droppedQueueFrameCount;
   }
   txQueue[txQueueHead] = frame;
   txQueueHead = static_cast<uint8_t>((txQueueHead + 1) % TX_QUEUE_SIZE);
@@ -206,12 +220,14 @@ void queueDccPacket(const uint8_t *bytes, uint8_t length, bool highPriority) {
   RadioFrame frame{};
   makeFrame(FRAME_TYPE_DCC_PACKET, flags, bytes, length, frame);
   enqueueFrame(frame);
+  ++queuedPayloadCount;
 }
 
 void queueKeepalive() {
   RadioFrame frame{};
   makeFrame(FRAME_TYPE_KEEPALIVE, 0x08, nullptr, 0, frame);
   enqueueFrame(frame);
+  ++queuedKeepaliveCount;
 }
 
 void onEspNowSent(const esp_now_send_info_t *, esp_now_send_status_t status) {
@@ -233,6 +249,9 @@ void pumpEspNowTx() {
   txQueueTail = static_cast<uint8_t>((txQueueTail + 1) % TX_QUEUE_SIZE);
   const esp_err_t result = esp_now_send(broadcastAddress, reinterpret_cast<uint8_t *>(&frame), sizeof(frame));
   if (result == ESP_OK) {
+    ++espNowSendStartCount;
+    lastSentFrameType = frame.type;
+    lastSentFrameSequence = frame.sequence;
     espNowBusy = true;
   } else {
     ++sendFailCount;
@@ -416,6 +435,7 @@ void maybeRefreshCachedPacket() {
         packetSlots[index].refreshable &&
         (now - packetSlots[index].lastSentMs) >= STATE_REFRESH_INTERVAL_MS) {
       queueDccPacket(packetSlots[index].data, packetSlots[index].length, false);
+      ++queuedRefreshCount;
       packetSlots[index].lastSentMs = now;
       refreshIndex = static_cast<uint8_t>((index + 1) % MAX_PACKET_SLOTS);
       lastRefreshMs = now;
@@ -426,12 +446,20 @@ void maybeRefreshCachedPacket() {
 
 void maybeSendKeepalive() {
   const uint32_t now = millis();
-  if (!isDccSourceAlive(now)) {
+  const bool dccSourceAlive = isDccSourceAlive(now);
+  if (!dccSourceAlive && !SEND_KEEPALIVE_WITHOUT_DCC_SOURCE) {
     return;
   }
   if ((now - lastKeepaliveMs) >= KEEPALIVE_INTERVAL_MS) {
     queueKeepalive();
     lastKeepaliveMs = now;
+    if (DEBUG_SERIAL && (now - lastDebugKeepaliveMs) >= DEBUG_KEEPALIVE_INTERVAL_MS) {
+      lastDebugKeepaliveMs = now;
+      debugPrintf("Keepalive queued seq=%u dccSource=%s queuedKeepalive=%lu\n",
+                  static_cast<uint8_t>(sequenceCounter - 1),
+                  dccSourceAlive ? "YES" : "NO",
+                  static_cast<unsigned long>(queuedKeepaliveCount));
+    }
   }
 }
 
@@ -598,6 +626,48 @@ void updateStatusLed() {
   }
 }
 
+void updateDebugStats() {
+  if (!DEBUG_SERIAL) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool dccSourceAlive = isDccSourceAlive(now);
+  if (dccSourceAlive != lastDccSourceAliveState) {
+    lastDccSourceAliveState = dccSourceAlive;
+    debugPrintf("DCC source %s at %lu ms\n",
+                dccSourceAlive ? "ACTIVE" : "TIMEOUT",
+                static_cast<unsigned long>(now));
+  }
+
+  if ((now - lastDebugStatsMs) < DEBUG_STATS_INTERVAL_MS) {
+    return;
+  }
+  lastDebugStatsMs = now;
+
+  uint8_t queued = 0;
+  if (txQueueHead >= txQueueTail) {
+    queued = txQueueHead - txQueueTail;
+  } else {
+    queued = static_cast<uint8_t>(TX_QUEUE_SIZE - txQueueTail + txQueueHead);
+  }
+
+  debugPrintf("Stats dcc=%s decoded=%lu payloadQ=%lu refreshQ=%lu keepaliveQ=%lu sendStart=%lu sentOk=%lu fail=%lu drop=%lu queue=%u busy=%u lastType=%u lastSeq=%u\n",
+              dccSourceAlive ? "ACTIVE" : "NO",
+              static_cast<unsigned long>(decodedPacketCount),
+              static_cast<unsigned long>(queuedPayloadCount),
+              static_cast<unsigned long>(queuedRefreshCount),
+              static_cast<unsigned long>(queuedKeepaliveCount),
+              static_cast<unsigned long>(espNowSendStartCount),
+              static_cast<unsigned long>(sentFrameCount),
+              static_cast<unsigned long>(sendFailCount),
+              static_cast<unsigned long>(droppedQueueFrameCount),
+              queued,
+              espNowBusy ? 1 : 0,
+              lastSentFrameType,
+              lastSentFrameSequence);
+}
+
 }  // namespace
 
 void setup() {
@@ -607,6 +677,9 @@ void setup() {
   debugPrintln("BDCC ESP32-C3 ESP-NOW central boot");
   debugPrintf("Build: %s %s\n", __DATE__, __TIME__);
   debugPrintf("DCC input GPIO: %u, status LED GPIO: %u\n", PIN_DCC_IN, PIN_STATUS_LED);
+  debugPrintf("ESP-NOW channel: %u, keepalive without DCC source: %s\n",
+              ESPNOW_CHANNEL,
+              SEND_KEEPALIVE_WITHOUT_DCC_SOURCE ? "YES" : "NO");
 #if defined(LED_BUILTIN)
   debugPrintf("LED_BUILTIN GPIO: %d\n", LED_BUILTIN);
 #else
@@ -632,4 +705,5 @@ void loop() {
   maybeSendKeepalive();
   pumpEspNowTx();
   updateStatusLed();
+  updateDebugStats();
 }
