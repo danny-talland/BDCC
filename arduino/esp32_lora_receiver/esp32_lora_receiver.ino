@@ -42,6 +42,7 @@ constexpr uint32_t PACKET_SLOT_EXPIRE_MS = 10000;
 constexpr uint32_t PAYLOAD_ACTIVITY_MS = 200;
 constexpr uint32_t KEEPALIVE_ACTIVITY_MS = 200;
 constexpr uint32_t DISPLAY_UPDATE_MS = 150;
+constexpr uint8_t RADIO_TEXT_BUFFER_SIZE = 40;
 constexpr uint16_t EEPROM_SIZE = 64;
 constexpr uint16_t EEPROM_CONFIG_ADDRESS = 0;
 constexpr uint16_t CONFIG_MAGIC = 0xBDCC;
@@ -113,7 +114,7 @@ portMUX_TYPE dccMux = portMUX_INITIALIZER_UNLOCKED;
 
 CachedPacket packetSlots[MAX_PACKET_SLOTS] = {};
 ReceiverConfig receiverConfig = {};
-RadioFrame pendingFrame = {};
+char pendingTextFrame[RADIO_TEXT_BUFFER_SIZE] = {};
 volatile bool pendingFrameReady = false;
 volatile int16_t lastRssi = 0;
 volatile int8_t lastSnr = 0;
@@ -134,20 +135,12 @@ uint32_t lastPayloadMs = 0;
 uint32_t lastKeepaliveMs = 0;
 uint32_t lastConfigMs = 0;
 uint32_t lastDisplayMs = 0;
+uint16_t lastPayloadAddress = 0;
 uint8_t lastSequence = 0;
 uint8_t roundRobinIndex = 0;
 bool lastSequenceValid = false;
 bool loraIdle = true;
 bool hasSeenPayload = false;
-
-uint8_t checksumFrame(const RadioFrame &frame) {
-  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&frame);
-  uint8_t x = 0;
-  for (uint8_t i = 0; i < sizeof(RadioFrame) - 1; ++i) {
-    x ^= bytes[i];
-  }
-  return x;
-}
 
 uint8_t checksumConfig(const ReceiverConfig &config) {
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&config);
@@ -506,6 +499,7 @@ void storePacket(const RadioFrame &frame) {
   packetSlots[slot].valid = true;
   packetSlots[slot].length = frame.length;
   packetSlots[slot].lastSeenMs = millis();
+  lastPayloadAddress = frame.data[0];
   for (uint8_t i = 0; i < frame.length && i < MAX_DCC_PACKET_BYTES; ++i) {
     packetSlots[slot].data[i] = frame.data[i];
   }
@@ -548,14 +542,82 @@ void serviceDccOutput() {
 }
 
 void onRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
-  if (size == sizeof(RadioFrame)) {
-    memcpy(&pendingFrame, payload, sizeof(RadioFrame));
-    pendingFrameReady = true;
-    lastRssi = rssi;
-    lastSnr = snr;
-  }
+  const uint16_t copyLength = size < (RADIO_TEXT_BUFFER_SIZE - 1) ? size : (RADIO_TEXT_BUFFER_SIZE - 1);
+  memcpy(pendingTextFrame, payload, copyLength);
+  pendingTextFrame[copyLength] = '\0';
+  pendingFrameReady = true;
+  lastRssi = rssi;
+  lastSnr = snr;
   Radio.Sleep();
   loraIdle = true;
+}
+
+int8_t parseHexNibble(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  return -1;
+}
+
+bool parseHexBytes(const char *hex, uint8_t *data, uint8_t &length) {
+  const size_t hexLength = strlen(hex);
+  if (hexLength == 0 || (hexLength % 2) != 0 || hexLength > (MAX_DCC_PACKET_BYTES * 2)) {
+    return false;
+  }
+  length = static_cast<uint8_t>(hexLength / 2);
+  for (uint8_t i = 0; i < length; ++i) {
+    const int8_t high = parseHexNibble(hex[i * 2]);
+    const int8_t low = parseHexNibble(hex[i * 2 + 1]);
+    if (high < 0 || low < 0) {
+      return false;
+    }
+    data[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool parseTextFrame(const char *text, RadioFrame &frame) {
+  frame = RadioFrame{};
+  unsigned int version = 0;
+  unsigned int sequence = 0;
+  char frameType = 0;
+
+  if (sscanf(text, "B%u,%u,%c", &version, &sequence, &frameType) != 3 ||
+      version != PROTOCOL_VERSION ||
+      sequence > 255) {
+    return false;
+  }
+
+  frame.version = static_cast<uint8_t>(version);
+  frame.sequence = static_cast<uint8_t>(sequence);
+  if (frameType == 'K') {
+    frame.type = FRAME_TYPE_KEEPALIVE;
+    return true;
+  }
+  if (frameType != 'D') {
+    return false;
+  }
+
+  const char *payloadStart = strchr(text, 'D');
+  if (payloadStart == nullptr || payloadStart[1] != ',') {
+    return false;
+  }
+  payloadStart += 2;
+
+  char *endPtr = nullptr;
+  const unsigned long flags = strtoul(payloadStart, &endPtr, 10);
+  if (endPtr == payloadStart || *endPtr != ',' || flags > 255) {
+    return false;
+  }
+  frame.type = FRAME_TYPE_DCC_PACKET;
+  frame.flags = static_cast<uint8_t>(flags);
+  return parseHexBytes(endPtr + 1, frame.data, frame.length);
 }
 
 void processPendingFrame() {
@@ -563,17 +625,14 @@ void processPendingFrame() {
     return;
   }
 
-  RadioFrame frame{};
+  char text[RADIO_TEXT_BUFFER_SIZE] = {};
   noInterrupts();
-  memcpy(&frame, &pendingFrame, sizeof(frame));
+  memcpy(text, pendingTextFrame, sizeof(text));
   pendingFrameReady = false;
   interrupts();
 
-  if (frame.magic != PROTOCOL_MAGIC ||
-      frame.version != PROTOCOL_VERSION ||
-      frame.length > MAX_DCC_PACKET_BYTES ||
-      frame.checksum != checksumFrame(frame) ||
-      !isNewerSequence(frame.sequence)) {
+  RadioFrame frame{};
+  if (!parseTextFrame(text, frame) || !isNewerSequence(frame.sequence)) {
     return;
   }
 
@@ -612,14 +671,12 @@ void drawPowerIcon() {
   display.fillRect(60, 8, 9, 25);
 }
 
-void drawPacketIcon() {
-  display.drawRect(36, 18, 35, 26);
-  display.drawLine(36, 18, 53, 33);
-  display.drawLine(71, 18, 53, 33);
-  display.drawLine(82, 31, 105, 18);
-  display.drawLine(82, 31, 105, 44);
-  display.drawLine(105, 18, 105, 44);
-  display.fillRect(96, 25, 9, 14);
+void drawPayloadAddress() {
+  char addressText[6] = {};
+  snprintf(addressText, sizeof(addressText), "%u", lastPayloadAddress);
+  display.setTextAlignment(TEXT_ALIGN_CENTER_BOTH);
+  display.setFont(ArialMT_Plain_24);
+  display.drawString(display.getWidth() / 2, display.getHeight() / 2, addressText);
 }
 
 void drawHeartbeatIcon() {
@@ -695,7 +752,7 @@ void updateDisplay() {
       drawAntenna(48, 17, true);
       break;
     case SCENARIO_PAYLOAD:
-      drawPacketIcon();
+      drawPayloadAddress();
       break;
     case SCENARIO_KEEPALIVE:
       drawHeartbeatIcon();

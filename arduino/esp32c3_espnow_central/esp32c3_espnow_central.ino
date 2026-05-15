@@ -1,27 +1,22 @@
-#include "Arduino.h"
-#include "LoRaWan_APP.h"
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <string.h>
 
 namespace {
 
 constexpr uint8_t PIN_DCC_IN = 2;
+constexpr uint8_t PIN_STATUS_LED = 8;
+constexpr bool STATUS_LED_ACTIVE_HIGH = true;
 
-constexpr uint32_t RF_FREQUENCY = 868000000;
-constexpr int8_t TX_OUTPUT_POWER = 10;
-constexpr uint8_t LORA_BANDWIDTH = 0;
-constexpr uint8_t LORA_SPREADING_FACTOR = 7;
-constexpr uint8_t LORA_CODING_RATE = 1;
-constexpr uint16_t LORA_PREAMBLE_LENGTH = 8;
-constexpr bool LORA_FIXED_LENGTH = false;
-constexpr bool LORA_IQ_INVERSION = false;
-constexpr uint32_t LORA_TX_TIMEOUT_MS = 3000;
-
-constexpr uint8_t PROTOCOL_VERSION = 2;
+constexpr uint8_t ESPNOW_CHANNEL = 6;
+constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint16_t PROTOCOL_MAGIC = 0xBDCC;
 constexpr uint8_t MAX_DCC_PACKET_BYTES = 6;
 constexpr uint8_t MAX_PACKET_SLOTS = 24;
-constexpr uint8_t TX_QUEUE_SIZE = 8;
-constexpr uint8_t HALF_BIT_BUFFER_SIZE = 96;
+constexpr uint8_t TX_QUEUE_SIZE = 10;
+constexpr uint8_t HALF_BIT_BUFFER_SIZE = 128;
 constexpr uint8_t ADDRESS_MIN = 1;
 constexpr uint8_t ADDRESS_MAX = 20;
 constexpr uint8_t RECEIVER_CONFIG_ADDRESS = 99;
@@ -31,18 +26,26 @@ constexpr uint16_t DCC_ONE_MAX_US = 80;
 constexpr uint16_t DCC_ZERO_MIN_US = 90;
 constexpr uint16_t PACKET_GAP_US = 5000;
 constexpr uint32_t STATE_REFRESH_INTERVAL_MS = 2000;
-constexpr uint32_t STATE_REFRESH_MIN_SPACING_MS = 80;
+constexpr uint32_t STATE_REFRESH_MIN_SPACING_MS = 50;
 constexpr uint32_t KEEPALIVE_INTERVAL_MS = 1000;
 constexpr uint32_t DCC_SOURCE_TIMEOUT_MS = 1500;
-constexpr uint8_t RADIO_TEXT_BUFFER_SIZE = 40;
+constexpr uint32_t LED_HEALTH_BLINK_MS = 1000;
+constexpr uint32_t LED_TX_FLASH_MS = 40;
 
 enum FrameType : uint8_t {
   FRAME_TYPE_DCC_PACKET = 1,
   FRAME_TYPE_KEEPALIVE = 2
 };
 
-struct RadioTextFrame {
-  char text[RADIO_TEXT_BUFFER_SIZE];
+struct __attribute__((packed)) RadioFrame {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint8_t sequence;
+  uint8_t flags;
+  uint8_t length;
+  uint8_t data[MAX_DCC_PACKET_BYTES];
+  uint8_t checksum;
 };
 
 struct CachedPacket {
@@ -59,6 +62,8 @@ enum DecodeState : uint8_t {
   READ_BYTE_BITS,
   READ_DELIMITER
 };
+
+const uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 volatile uint32_t lastEdgeMicros = 0;
 volatile uint16_t halfBitBuffer[HALF_BIT_BUFFER_SIZE] = {};
@@ -79,19 +84,34 @@ uint8_t pendingHalfBitValue = 0;
 uint32_t lastPacketMicros = 0;
 uint32_t lastDccSourceMs = 0;
 uint32_t lastKeepaliveMs = 0;
+uint32_t lastTxMs = 0;
+uint32_t lastLedToggleMs = 0;
+bool ledState = false;
 
 CachedPacket packetSlots[MAX_PACKET_SLOTS] = {};
-RadioTextFrame txQueue[TX_QUEUE_SIZE] = {};
+RadioFrame txQueue[TX_QUEUE_SIZE] = {};
 uint8_t txQueueHead = 0;
 uint8_t txQueueTail = 0;
-bool loraIdle = true;
+volatile bool espNowBusy = false;
 
-static RadioEvents_t radioEvents;
+void setLed(bool on) {
+  ledState = on;
+  digitalWrite(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH ? on : !on);
+}
 
 uint8_t checksumBytes(const uint8_t *data, uint8_t length) {
   uint8_t x = 0;
   for (uint8_t i = 0; i < length; ++i) {
     x ^= data[i];
+  }
+  return x;
+}
+
+uint8_t checksumFrame(const RadioFrame &frame) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&frame);
+  uint8_t x = 0;
+  for (uint8_t i = 0; i < sizeof(RadioFrame) - 1; ++i) {
+    x ^= bytes[i];
   }
   return x;
 }
@@ -104,7 +124,7 @@ bool queueEmpty() {
   return txQueueHead == txQueueTail;
 }
 
-void enqueueFrame(const RadioTextFrame &frame) {
+void enqueueFrame(const RadioFrame &frame) {
   if (queueFull()) {
     txQueueTail = static_cast<uint8_t>((txQueueTail + 1) % TX_QUEUE_SIZE);
   }
@@ -112,37 +132,18 @@ void enqueueFrame(const RadioTextFrame &frame) {
   txQueueHead = static_cast<uint8_t>((txQueueHead + 1) % TX_QUEUE_SIZE);
 }
 
-char hexNibble(uint8_t value) {
-  value &= 0x0F;
-  return value < 10 ? static_cast<char>('0' + value) : static_cast<char>('A' + value - 10);
-}
-
-void appendHexByte(char *text, uint8_t &offset, uint8_t value) {
-  if (offset + 2 >= RADIO_TEXT_BUFFER_SIZE) {
-    return;
-  }
-  text[offset++] = hexNibble(value >> 4);
-  text[offset++] = hexNibble(value);
-  text[offset] = '\0';
-}
-
-void makeDccFrame(uint8_t flags, const uint8_t *data, uint8_t length, RadioTextFrame &frame) {
-  frame = RadioTextFrame{};
-  const int written = snprintf(frame.text, sizeof(frame.text), "B%u,%u,D,%u,",
-                               PROTOCOL_VERSION, sequenceCounter++, flags);
-  if (written < 0 || written >= static_cast<int>(sizeof(frame.text))) {
-    frame.text[0] = '\0';
-    return;
-  }
-  uint8_t offset = static_cast<uint8_t>(written);
+void makeFrame(uint8_t type, uint8_t flags, const uint8_t *data, uint8_t length, RadioFrame &frame) {
+  frame = RadioFrame{};
+  frame.magic = PROTOCOL_MAGIC;
+  frame.version = PROTOCOL_VERSION;
+  frame.type = type;
+  frame.sequence = sequenceCounter++;
+  frame.flags = flags;
+  frame.length = length;
   for (uint8_t i = 0; i < length && i < MAX_DCC_PACKET_BYTES; ++i) {
-    appendHexByte(frame.text, offset, data[i]);
+    frame.data[i] = data[i];
   }
-}
-
-void makeKeepaliveFrame(RadioTextFrame &frame) {
-  frame = RadioTextFrame{};
-  snprintf(frame.text, sizeof(frame.text), "B%u,%u,K", PROTOCOL_VERSION, sequenceCounter++);
+  frame.checksum = checksumFrame(frame);
 }
 
 void queueDccPacket(const uint8_t *bytes, uint8_t length, bool highPriority) {
@@ -157,38 +158,32 @@ void queueDccPacket(const uint8_t *bytes, uint8_t length, bool highPriority) {
     flags |= 0x10;
   }
 
-  RadioTextFrame frame{};
-  makeDccFrame(flags, bytes, length, frame);
+  RadioFrame frame{};
+  makeFrame(FRAME_TYPE_DCC_PACKET, flags, bytes, length, frame);
   enqueueFrame(frame);
 }
 
 void queueKeepalive() {
-  RadioTextFrame frame{};
-  makeKeepaliveFrame(frame);
+  RadioFrame frame{};
+  makeFrame(FRAME_TYPE_KEEPALIVE, 0x08, nullptr, 0, frame);
   enqueueFrame(frame);
 }
 
-void pumpLoRaTx() {
-  if (!loraIdle || queueEmpty()) {
+void onEspNowSent(const esp_now_send_info_t *, esp_now_send_status_t) {
+  espNowBusy = false;
+  lastTxMs = millis();
+}
+
+void pumpEspNowTx() {
+  if (espNowBusy || queueEmpty()) {
     return;
   }
 
-  RadioTextFrame frame = txQueue[txQueueTail];
+  RadioFrame frame = txQueue[txQueueTail];
   txQueueTail = static_cast<uint8_t>((txQueueTail + 1) % TX_QUEUE_SIZE);
-  if (frame.text[0] == '\0') {
-    return;
+  if (esp_now_send(broadcastAddress, reinterpret_cast<uint8_t *>(&frame), sizeof(frame)) == ESP_OK) {
+    espNowBusy = true;
   }
-  Radio.Send(reinterpret_cast<uint8_t *>(frame.text), strlen(frame.text));
-  loraIdle = false;
-}
-
-void onTxDone() {
-  loraIdle = true;
-}
-
-void onTxTimeout() {
-  Radio.Sleep();
-  loraIdle = true;
 }
 
 void IRAM_ATTR onDccEdge() {
@@ -498,21 +493,50 @@ void processHalfBitStream() {
   }
 }
 
+void setupEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    while (true) {
+      setLed(!ledState);
+      delay(100);
+    }
+  }
+
+  esp_now_register_send_cb(onEspNowSent);
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, broadcastAddress, sizeof(broadcastAddress));
+  peer.channel = ESPNOW_CHANNEL;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+void updateStatusLed() {
+  const uint32_t now = millis();
+  if ((now - lastTxMs) < LED_TX_FLASH_MS) {
+    setLed(true);
+    return;
+  }
+
+  if ((now - lastLedToggleMs) >= LED_HEALTH_BLINK_MS) {
+    lastLedToggleMs = now;
+    setLed(!ledState);
+  }
+}
+
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_DCC_IN, INPUT);
-  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  setLed(true);
 
-  radioEvents.TxDone = onTxDone;
-  radioEvents.TxTimeout = onTxTimeout;
-  Radio.Init(&radioEvents);
-  Radio.SetChannel(RF_FREQUENCY);
-  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
-                    LORA_SPREADING_FACTOR, LORA_CODING_RATE,
-                    LORA_PREAMBLE_LENGTH, LORA_FIXED_LENGTH,
-                    true, 0, 0, LORA_IQ_INVERSION, LORA_TX_TIMEOUT_MS);
+  pinMode(PIN_DCC_IN, INPUT);
+  setupEspNow();
 
   attachInterrupt(digitalPinToInterrupt(PIN_DCC_IN), onDccEdge, CHANGE);
   resetDecoder();
@@ -523,6 +547,6 @@ void loop() {
   processHalfBitStream();
   maybeRefreshCachedPacket();
   maybeSendKeepalive();
-  pumpLoRaTx();
-  Radio.IrqProcess();
+  pumpEspNowTx();
+  updateStatusLed();
 }

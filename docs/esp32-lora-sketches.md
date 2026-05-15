@@ -21,6 +21,20 @@ Dit past bij ESP32-S3 boards met SX1262 LoRa en 0.96" OLED.
 
 Er is één transmitter. Die zendt LoRa-frames als broadcast uit. Alle receivers luisteren continu mee en verwerken dezelfde radiostroom.
 
+De radioframes zijn bewust ASCII-tekst, niet binaire C++ structs. Dat volgt hetzelfde gedrag als de Heltec voorbeeldsketches en voorkomt problemen door struct-padding, endianess of lengteverschillen tussen sketches.
+
+```text
+B2,<sequence>,K
+B2,<sequence>,D,<flags>,<dcc-packet-hex>
+```
+
+Voorbeeld:
+
+```text
+B2,17,K
+B2,18,D,5,033F7E42
+```
+
 De transmitter:
 
 - decodeert DCC op `PIN_DCC_IN`
@@ -57,7 +71,7 @@ De receiver gebruikt geen LED event mask. Scenario's worden altijd als grote ico
 |---|---|
 | startup | power-symbool |
 | link down | antenne met kruis |
-| payload | envelop/pijl |
+| payload | groot DCC-adres van het laatst ontvangen packet |
 | keepalive | heartbeat |
 | failsafe | dubbele cirkel met uitroepteken |
 | config | tandwiel |
@@ -98,12 +112,12 @@ Gecontroleerd op Heltec WiFi LoRa 32 V3:
 
 ```text
 esp32_lora_transmitter:
-Sketch uses 356803 bytes (10%) flash
-Global variables use 25020 bytes (7%) RAM
+Sketch uses 357019 bytes (10%) flash
+Global variables use 25228 bytes (7%) RAM
 
 esp32_lora_receiver:
-Sketch uses 378423 bytes (11%) flash
-Global variables use 25292 bytes (7%) RAM
+Sketch uses 396855 bytes (11%) flash
+Global variables use 25316 bytes (7%) RAM
 ```
 
 ## Beperkingen
