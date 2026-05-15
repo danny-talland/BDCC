@@ -14,6 +14,7 @@ constexpr bool DEBUG_SERIAL = true;
 constexpr bool SEND_KEEPALIVE_WITHOUT_DCC_SOURCE = true;
 
 constexpr uint8_t ESPNOW_CHANNEL = 6;
+constexpr int8_t WIFI_MAX_TX_POWER_QDBM = 78;  // 78 * 0.25 dBm = 19.5 dBm.
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint16_t PROTOCOL_MAGIC = 0xBDCC;
 constexpr uint8_t MAX_DCC_PACKET_BYTES = 6;
@@ -30,7 +31,7 @@ constexpr uint16_t DCC_ZERO_MIN_US = 90;
 constexpr uint16_t PACKET_GAP_US = 5000;
 constexpr uint32_t STATE_REFRESH_INTERVAL_MS = 2000;
 constexpr uint32_t STATE_REFRESH_MIN_SPACING_MS = 50;
-constexpr uint32_t KEEPALIVE_INTERVAL_MS = 1000;
+constexpr uint32_t KEEPALIVE_INTERVAL_MS = 500;
 constexpr uint32_t DCC_SOURCE_TIMEOUT_MS = 1500;
 constexpr uint32_t LED_HEALTH_BLINK_MS = 1000;
 constexpr uint32_t LED_TX_FLASH_MS = 40;
@@ -589,8 +590,12 @@ void setupEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_err_t result = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  const esp_err_t powerResult = esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
   debugPrintf("WiFi STA MAC: %s\n", WiFi.macAddress().c_str());
   debugPrintf("ESP-NOW channel set result: %d\n", static_cast<int>(result));
+  debugPrintf("WiFi max TX power set result: %d target=%.1f dBm\n",
+              static_cast<int>(powerResult),
+              WIFI_MAX_TX_POWER_QDBM / 4.0f);
 
   result = esp_now_init();
   if (result != ESP_OK) {
@@ -680,6 +685,9 @@ void setup() {
   debugPrintf("ESP-NOW channel: %u, keepalive without DCC source: %s\n",
               ESPNOW_CHANNEL,
               SEND_KEEPALIVE_WITHOUT_DCC_SOURCE ? "YES" : "NO");
+  debugPrintf("Keepalive interval: %lu ms, WiFi TX power target: %.1f dBm\n",
+              static_cast<unsigned long>(KEEPALIVE_INTERVAL_MS),
+              WIFI_MAX_TX_POWER_QDBM / 4.0f);
 #if defined(LED_BUILTIN)
   debugPrintf("LED_BUILTIN GPIO: %d\n", LED_BUILTIN);
 #else

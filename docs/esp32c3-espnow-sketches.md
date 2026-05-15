@@ -192,11 +192,21 @@ DCC source ACTIVE at ... ms
 DCC packet addr=3 len=3 decoded=...
 ```
 
+Voor stabiliteit staat de ESP-NOW variant nu conservatiever ingesteld:
+
+| Instelling | Waarde |
+|---|---:|
+| central keepalive interval | `500 ms` |
+| receiver link-down timeout default | `5 s` |
+| central WiFi TX power target | `19.5 dBm` |
+
+De receiver config-versie is verhoogd, zodat bestaande EEPROM-config bij upload/start automatisch naar deze nieuwe default wordt gezet. Later kan de timeout weer via CV `901` worden aangepast.
+
 Resultaat:
 
 ```text
 esp32c3_espnow_central:
-Sketch uses 956713 bytes (72%) flash
+Sketch uses 957055 bytes (73%) flash
 Global variables use 37012 bytes (11%) RAM
 
 esp32c3_espnow_receiver:

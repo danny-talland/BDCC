@@ -38,7 +38,7 @@ constexpr uint32_t DEBUG_STATS_INTERVAL_MS = 5000;
 constexpr uint16_t EEPROM_SIZE = 64;
 constexpr uint16_t EEPROM_CONFIG_ADDRESS = 0;
 constexpr uint16_t CONFIG_MAGIC = 0xBDCC;
-constexpr uint8_t CONFIG_VERSION = 1;
+constexpr uint8_t CONFIG_VERSION = 2;
 
 constexpr uint16_t CV_LINK_TIMEOUT_TICKS = 901;
 constexpr uint16_t CV_LINK_DOWN_BRAKE_TICKS = 902;
@@ -188,7 +188,7 @@ ReceiverConfig defaultConfig() {
   ReceiverConfig config{};
   config.magic = CONFIG_MAGIC;
   config.version = CONFIG_VERSION;
-  config.linkDownTicks100ms = 20;
+  config.linkDownTicks100ms = 50;
   config.linkDownBrakeTicks100ms = 30;
   config.linkUpAccelTicks100ms = 20;
   config.maxResumeSpeedStep = 126;
